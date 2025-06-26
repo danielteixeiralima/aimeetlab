@@ -1,4 +1,3 @@
-<!-- layout.html -->
 <!DOCTYPE html>
 <html lang="pt-br" data-bs-theme="dark">
 <head>
@@ -39,7 +38,8 @@
                                 <i data-feather="plus" class="me-1" style="width: 16px; height: 16px;"></i> Nova Análise
                             </a>
                         </li>
-                        {% if current_user.google_calendar_enabled %}
+                        {# MOSTRA estes itens se o usuário estiver conectado via Google OU Teams #}
+                        {% if current_user.google_calendar_enabled or session.get('msal_account') %}
                         <li class="nav-item">
                             <a class="nav-link" href="{{ url_for('view_calendar') }}">
                                 <i data-feather="calendar" class="me-1" style="width: 16px; height: 16px;"></i> Meu Calendário
@@ -119,7 +119,6 @@
     </script>
     <script src="{{ url_for('static', filename='js/main.js') }}"></script>
 
-    {% block scripts %}
-    {% endblock %}
+    {% block scripts %}{% endblock %}
 </body>
 </html>

@@ -21,7 +21,12 @@ import dateutil.parser
 from flask import Flask
 from markupsafe import Markup
 import pytz
-
+import dns.resolver
+from functools import lru_cache
+from msal import ConfidentialClientApplication
+from msal import SerializableTokenCache
+from flask_session import Session
+from uuid import uuid4
 
 
 
@@ -48,6 +53,22 @@ app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
         "keepalives_count": 5
     }
 }
+
+app.config['AZURE_CLIENT_ID']     = os.getenv('AZURE_CLIENT_ID')
+app.config['AZURE_CLIENT_SECRET'] = os.getenv('AZURE_CLIENT_SECRET')
+app.config['AZURE_TENANT_ID']     = os.getenv('AZURE_TENANT_ID')
+app.config['MSAL_REDIRECT_URI']   = os.getenv('MSAL_REDIRECT_URI')
+app.secret_key = os.environ.get("SESSION_SECRET")  # agora existe em .env
+app.config['SESSION_TYPE'] = 'filesystem'
+Session(app)
+# validação mínima
+if not all([
+    app.config['AZURE_CLIENT_ID'],
+    app.config['AZURE_CLIENT_SECRET'],
+    app.config['AZURE_TENANT_ID'],
+    app.config['MSAL_REDIRECT_URI']
+]):
+    raise RuntimeError("Faltam variáveis AZURE_* no .env")
 
 @app.template_filter('datetime')
 def format_datetime(value, fmt='%d/%m/%Y %H:%M'):
@@ -1109,7 +1130,15 @@ from google_calendar import (
 @login_required
 def settings():
     """Página de configurações da conta do usuário"""
-    return render_template('settings.html')
+    # 1) extrai domínio do email do usuário
+    owner_domain = current_user.email.split('@', 1)[1]
+    # 2) detecta provedor (google, outlook ou None)
+    owner_provider = get_email_provider(owner_domain)
+    # 3) passa para o template
+    return render_template(
+        'settings.html',
+        owner_provider=owner_provider
+    )
 
 @app.route('/settings/google_calendar_connect')
 @login_required
@@ -1291,75 +1320,220 @@ def event_details(event_id):
         flash(f"Erro ao buscar detalhes do evento: {str(e)}", "danger")
         return redirect(url_for('view_calendar'))
 
+
+
+@lru_cache(maxsize=256)
+def get_email_provider(domain: str) -> str | None:
+    """Detecta se o domínio usa Google Workspace ou Office365/Teams via MX."""
+    try:
+        answers = dns.resolver.resolve(domain, 'MX')
+    except Exception:
+        return None
+    for r in answers:
+        mx = str(r.exchange).lower()
+        if 'google' in mx or 'googlemail' in mx:
+            return 'google'
+        if 'outlook' in mx or 'protection.outlook.com' in mx or 'office365' in mx:
+            return 'outlook'
+    return None
+
+def load_cache() -> SerializableTokenCache:
+    cache = SerializableTokenCache()
+    if session.get("msal_token_cache"):
+        cache.deserialize(session["msal_token_cache"])
+    return cache
+
+def save_cache(cache: SerializableTokenCache):
+    session["msal_token_cache"] = cache.serialize()
+
+def get_msal_app() -> ConfidentialClientApplication:
+    """Instancia o app MSAL com cache serializável persistido na sessão."""
+    cache = load_cache()
+    app = ConfidentialClientApplication(
+        client_id=os.environ['AZURE_CLIENT_ID'],
+        client_credential=os.environ['AZURE_CLIENT_SECRET'],
+        authority="https://login.microsoftonline.com/organizations",
+        token_cache=cache
+    )
+    save_cache(cache)
+    return app
+
+@app.route('/login/ms')
+@login_required
+def login_ms():
+    """Inicia o OAuth2 Authorization Code Flow com MSAL (só Graph scopes)."""
+    msal_app = get_msal_app()
+    auth_url = msal_app.get_authorization_request_url(
+        scopes=[
+           "User.Read",                   # <-- ESSENCIAL PARA /me
+           "OnlineMeetings.ReadWrite",
+           "Calendars.ReadWrite",
+        ],
+        redirect_uri=os.environ['MSAL_REDIRECT_URI']
+    )
+    return redirect(auth_url)
+
+@app.route('/logout/ms')
+@login_required
+def logout_ms():
+    """Desconecta a conta MSAL, limpando cache e conta da sessão."""
+    session.pop('msal_account', None)
+    session.pop('msal_token_cache', None)
+    # flash("Desconectado da Microsoft.", "info")
+    return redirect(url_for('settings'))
+@app.route('/auth/redirect')
+@login_required
+def auth_redirect():
+    code = request.args.get('code')
+    msal_app = get_msal_app()
+
+    result = msal_app.acquire_token_by_authorization_code(
+        code,
+        scopes=[
+           "User.Read",                   # <-- também aqui
+           "OnlineMeetings.ReadWrite",
+           "Calendars.ReadWrite",
+        ],
+        redirect_uri=os.environ['MSAL_REDIRECT_URI']
+    )
+    session["msal_token_cache"] = msal_app.token_cache.serialize()
+
+    if "error" in result:
+        flash(f"Falha ao autenticar com Microsoft: {result.get('error_description')}", "danger")
+        return redirect(url_for('create_event'))
+
+    accounts = msal_app.get_accounts()
+    if not accounts:
+        flash("Não encontrou conta MSAL após login.", "danger")
+        return redirect(url_for('create_event'))
+
+    session['msal_account'] = accounts[0]
+    flash("Conectado à Microsoft com sucesso!", "success")
+    return redirect(url_for('create_event'))
+
+def get_ms_graph_token() -> str:
+    """Retorna access_token delegado para o usuário logado, ou força relogin."""
+    msal_app = get_msal_app()
+    account = session.get('msal_account')
+    if not account:
+        raise RuntimeError("Precisa conectar com Microsoft antes de criar evento.")
+
+    result = msal_app.acquire_token_silent(
+        scopes=["User.Read", "OnlineMeetings.ReadWrite"],
+        account=account
+    )
+    if not result or 'access_token' not in result:
+        raise RuntimeError("Falha ao renovar token com a Microsoft.")
+    session["msal_token_cache"] = msal_app.token_cache.serialize()
+    return result['access_token']
+
+def create_teams_link(token: str) -> str:
+    """Gera um link de reunião Teams via POST /me/onlineMeetings."""
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+    body = {
+        'startDateTime': datetime.utcnow().isoformat() + 'Z',
+        'endDateTime':   (datetime.utcnow() + timedelta(hours=1)).isoformat() + 'Z',
+        'subject':       'Reunião via Teams'
+    }
+    resp = requests.post('https://graph.microsoft.com/v1.0/me/onlineMeetings', headers=headers, json=body)
+    resp.raise_for_status()
+    return resp.json().get('joinUrl')
+
 @app.route('/calendar/new', methods=['GET', 'POST'])
 @login_required
 def create_event():
-    """Criar novo evento no Google Calendar"""
+    """
+    Cria evento no Google Calendar para todos os convidados
+    (o Google manda o e-mail), mas injeta link do Teams ou gera Meet
+    conforme o provedor do e-mail do current_user.
+    """
+    # Verifica conexão com Google Calendar
     if not current_user.google_calendar_enabled:
         flash("Você precisa conectar sua conta do Google Calendar primeiro.", "warning")
         return redirect(url_for('settings'))
-        
+
     if request.method == 'POST':
-        try:
-            # Get form data
-            title = request.form.get('title')
-            description = request.form.get('description', '')
-            
-            # Parse start datetime
-            start_date = request.form.get('start_date')
-            start_time = request.form.get('start_time')
-            start_datetime = datetime.strptime(f"{start_date} {start_time}", "%Y-%m-%d %H:%M")
-            
-            # Parse end datetime
-            end_date = request.form.get('end_date')
-            end_time = request.form.get('end_time')
-            end_datetime = datetime.strptime(f"{end_date} {end_time}", "%Y-%m-%d %H:%M")
-            
-            # Get attendees
-            attendees = []
-            if request.form.get('attendees'):
-                attendees = [email.strip() for email in request.form.get('attendees').split(',') if email.strip()]
-            
-            # Garantir que hub@inovailab.com sempre seja chamado apenas uma vez
-            if "hub@inovailab.com" not in attendees:
-                attendees.append("hub@inovailab.com")
-            
-            # Get agenda
-            agenda = request.form.get('agenda', '')
-            
-            # Add agenda to description if provided
-            if agenda:
-                full_description = f"{description}\n\n--- AGENDA ---\n{agenda}"
-            else:
-                full_description = description
-            
-            # Get user's Google credentials
-            credentials = current_user.get_google_credentials()
-            
-            # Build Google Calendar service
-            service = build_service(credentials)
-            
-            # Create event
-            event = create_meeting_event(
-                service=service,
-                title=title,
-                description=full_description,
-                start_time=start_datetime,
-                end_time=end_datetime,
-                attendees=attendees
-            )
-            
-            flash("Reunião agendada com sucesso!", "success")
-            return redirect(url_for('event_details', event_id=event['id']))
-            
-        except Exception as e:
-            logger.error(f"Error creating calendar event: {str(e)}")
-            flash(f"Erro ao criar evento: {str(e)}", "danger")
-            return redirect(url_for('create_event'))
-            
+        # 1) Lê campos do formulário
+        title  = request.form['title']
+        desc   = request.form.get('description', '')
+        agenda = request.form.get('agenda', '').strip()
+        # monta descrição + pauta só se houver pauta
+        full_desc = desc
+        if agenda:
+            full_desc += f"\n\n--- AGENDA ---\n{agenda}"
+
+        # datas/hora de início e fim
+        start_dt = datetime.strptime(
+            f"{request.form['start_date']} {request.form['start_time']}",
+            "%Y-%m-%d %H:%M"
+        )
+        end_dt = datetime.strptime(
+            f"{request.form['end_date']} {request.form['end_time']}",
+            "%Y-%m-%d %H:%M"
+        )
+
+        # participantes
+        raw = request.form.get('attendees', '')
+        attendees = [e.strip() for e in raw.split(',') if e.strip()]
+        if 'hub@inovailab.com' not in attendees:
+            attendees.append('hub@inovailab.com')
+
+        # 2) Detecta provedor do dono da conta
+        owner_domain   = current_user.email.split('@', 1)[1]
+        owner_provider = get_email_provider(owner_domain)
+
+        # 3) Prepara body do evento
+        event_body = {
+            'summary':     title,
+            'description': full_desc,
+            'start':       {'dateTime': start_dt.isoformat(), 'timeZone': 'America/Sao_Paulo'},
+            'end':         {'dateTime': end_dt.isoformat(),   'timeZone': 'America/Sao_Paulo'},
+            'attendees': [
+                {'email': e, 'responseStatus': 'needsAction'}
+                for e in attendees
+            ],
+        }
+
+        # 4a) Se for Google Workspace: gera Meet
+        if owner_provider == 'google':
+            event_body['conferenceDataVersion'] = 1
+            event_body['conferenceData'] = {
+                'createRequest': {
+                    'requestId': uuid4().hex,
+                    'conferenceSolutionKey': {'type': 'hangoutsMeet'}
+                }
+            }
+
+        # 4b) Se for Office365/Outlook: gera Teams e anexa link
+        elif owner_provider == 'outlook':
+            token = get_ms_graph_token()
+            teams_link = create_teams_link(token)
+            event_body['description'] += f"\n\n--- Link da reunião Teams ---\n{teams_link}"
+
+        # 5) Insere no Calendar (envia convite a todos)
+        creds   = current_user.get_google_credentials()
+        service = build_service(creds)
+        service.events().insert(
+            calendarId='primary',
+            body=event_body,
+            conferenceDataVersion=event_body.get('conferenceDataVersion', 0),
+            sendUpdates='all'
+        ).execute()
+
+        flash("Reunião agendada com sucesso!", "success")
+        return render_template('create_event.html')
+
+    # GET: só renderiza o form
     return render_template('create_event.html')
 
-    
+
+
+
+
+
 @app.route('/generate_agenda', methods=['GET', 'POST'])
 @login_required
 def generate_agenda():
