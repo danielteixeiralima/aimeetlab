@@ -331,12 +331,110 @@ def sync_calendar_events_to_meetings(service):
 def list_meetings():
     search      = request.args.get('search', '')
     language    = request.args.get('language', '')
-    sort_by     = request.args.get('sort_by', 'meeting_date')  # default agora é meeting_date
+    sort_by     = request.args.get('sort_by', 'meeting_date')
     sort_order  = request.args.get('sort_order', 'desc')
     show_all    = request.args.get('show_all', 'false').lower() == 'true'
     page        = int(request.args.get('page', 1))
 
-    if not current_user.google_calendar_enabled:
+    meetings_page = []
+    total_pages = 0
+    languages = []
+    
+    # SE ESTIVER CONECTADO AO TEAMS (MSAL)
+    if session.get('msal_account'):
+        # 1) Busca eventos via Microsoft Graph
+        token = get_ms_graph_token()
+        headers = {'Authorization': f'Bearer {token}'}
+        now_iso = datetime.utcnow().isoformat() + 'Z'
+        all_events = []
+        url = f'https://graph.microsoft.com/v1.0/me/events?$filter=end/dateTime lt \'{now_iso}\'&$orderby=start/dateTime desc'
+        while url:
+            resp = requests.get(url, headers=headers).json()
+            batch = resp.get('value', [])
+            all_events.extend(batch)
+            url = resp.get('@odata.nextLink')
+
+        # 2) Sincroniza no banco
+        for ev in all_events:
+            eid = ev['id']
+            exists = Meeting.query.filter_by(
+                user_id=current_user.id,
+                google_calendar_event_id=eid
+            ).first()
+            if not exists:
+                # extrai agenda
+                body = ev.get('body', {}).get('content', '') or ''
+                agenda = body.split('--- AGENDA ---',1)[1].strip() if '--- AGENDA ---' in body else 'Pauta não definida'
+                sd = ev.get('start', {}).get('dateTime')
+                dt = datetime.fromisoformat(sd) if sd else None
+                cd = ev.get('createdDateTime')
+                cdt = datetime.fromisoformat(cd) if cd else None
+
+                m = Meeting(
+                    title=ev.get('subject', 'Reunião sem título'),
+                    agenda=agenda,
+                    transcription='',
+                    meeting_date=dt,
+                    created_at=cdt,
+                    user_id=current_user.id,
+                    google_calendar_event_id=eid
+                )
+                db.session.add(m)
+        db.session.commit()
+
+        event_ids = [e['id'] for e in all_events]
+
+    # SE NÃO, usa Google Calendar
+    elif current_user.google_calendar_enabled:
+        creds   = current_user.get_google_credentials()
+        service = build_service(creds)
+        now_iso = datetime.utcnow().isoformat() + 'Z'
+        all_events = []
+        page_token = None
+        while True:
+            resp = service.events().list(
+                calendarId='primary',
+                singleEvents=True,
+                orderBy='startTime',
+                timeMax=now_iso,
+                pageToken=page_token,
+                maxResults=2500
+            ).execute()
+            batch = resp.get('items', [])
+            all_events.extend(batch)
+            for event in batch:
+                eid = event.get('id')
+                exists = Meeting.query.filter_by(
+                    user_id=current_user.id,
+                    google_calendar_event_id=eid
+                ).first()
+                if not exists:
+                    desc = event.get('description','') or ''
+                    agenda = desc.split('--- AGENDA ---',1)[1].strip() if '--- AGENDA ---' in desc else 'Pauta não definida'
+                    sd = event.get('start',{}).get('dateTime')
+                    dt = datetime.fromisoformat(sd.replace('Z','+00:00')) if sd else None
+                    cd = event.get('created')
+                    cdt = datetime.fromisoformat(cd.replace('Z','+00:00')) if cd else None
+
+                    m = Meeting(
+                        title=event.get('summary','Reunião sem título'),
+                        agenda=agenda,
+                        transcription='',
+                        meeting_date=dt,
+                        created_at=cdt,
+                        user_id=current_user.id,
+                        google_calendar_event_id=eid
+                    )
+                    db.session.add(m)
+            db.session.commit()
+            page_token = resp.get('nextPageToken')
+            if not page_token:
+                break
+
+        event_ids = [ev['id'] for ev in all_events]
+
+    else:
+        # Nenhuma conta conectada
         return render_template('meetings.html',
                                meetings=[],
                                languages=[],
@@ -348,63 +446,7 @@ def list_meetings():
                                page=1,
                                total_pages=0)
 
-    # 1) credenciais
-    creds   = current_user.get_google_credentials()
-    service = build_service(creds)
-
-    # 2) busca TODOS os eventos passados em lotes (paginação da API) e sincroniza
-    now_iso    = datetime.utcnow().isoformat() + 'Z'
-    all_events = []
-    page_token = None
-    while True:
-        resp = service.events().list(
-            calendarId='primary',
-            singleEvents=True,
-            orderBy='startTime',
-            timeMax=now_iso,
-            pageToken=page_token,
-            maxResults=2500
-        ).execute()
-        batch = resp.get('items', [])
-        all_events.extend(batch)
-
-        for event in batch:
-            eid = event.get('id')
-            exists = Meeting.query.filter_by(
-                user_id=current_user.id,
-                google_calendar_event_id=eid
-            ).first()
-            if not exists:
-                desc = event.get('description','') or ''
-                if '--- AGENDA ---' in desc:
-                    agenda = desc.split('--- AGENDA ---',1)[1].strip()
-                else:
-                    agenda = 'Pauta não definida'
-
-                sd = event.get('start',{}).get('dateTime')
-                dt = datetime.fromisoformat(sd.replace('Z','+00:00')) if sd else None
-                cd = event.get('created')
-                cdt = datetime.fromisoformat(cd.replace('Z','+00:00')) if cd else None
-
-                m = Meeting(
-                    title=event.get('summary','Reunião sem título'),
-                    agenda=agenda,
-                    transcription='',
-                    meeting_date=dt,
-                    created_at=cdt,
-                    user_id=current_user.id,
-                    google_calendar_event_id=eid
-                )
-                db.session.add(m)
-        db.session.commit()
-
-        page_token = resp.get('nextPageToken')
-        if not page_token:
-            break
-
-    event_ids = [ev['id'] for ev in all_events]
-
-    # 3) Query no banco, só reuniões sincronizadas e já passadas
+    # 3) Monta query SQL
     if show_all:
         query = Meeting.query.filter_by(user_id=current_user.id)
     else:
@@ -414,13 +456,13 @@ def list_meetings():
         )
     query = query.filter(Meeting.meeting_date <= datetime.utcnow())
 
-    # 4) Filtros de pesquisa
+    # 4) filtros
     if search:
         query = query.filter(Meeting.title.ilike(f'%{search}%'))
     if language:
         query = query.filter(Meeting.language == language)
 
-    # 5) Ordenação
+    # 5) ordenação
     col_map = {
         'title':           Meeting.title,
         'alignment_score': Meeting.alignment_score,
@@ -428,21 +470,18 @@ def list_meetings():
         'created_at':      Meeting.created_at
     }
     order_col = col_map.get(sort_by, Meeting.meeting_date)
-    if sort_order == 'asc':
-        query = query.order_by(order_col.asc())
-    else:
-        query = query.order_by(order_col.desc())
+    query = query.order_by(order_col.asc() if sort_order=='asc' else order_col.desc())
 
-    # 6) paginação: 10 itens por página
+    # 6) paginação
     pagination    = query.paginate(page=page, per_page=10, error_out=False)
     meetings_page = pagination.items
     total_pages   = pagination.pages
 
-    # 7) idiomas existentes para filtro
+    # 7) idiomas
     langs = (db.session.query(Meeting.language)
-             .filter(Meeting.user_id == current_user.id,
+             .filter(Meeting.user_id==current_user.id,
                      Meeting.language.isnot(None),
-                     Meeting.language != '')
+                     Meeting.language!='')
              .distinct().all())
     languages = [l[0] for l in langs if l[0]]
 
@@ -458,6 +497,7 @@ def list_meetings():
         page=page,
         total_pages=total_pages
     )
+
 
 
 
