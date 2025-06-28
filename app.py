@@ -483,7 +483,7 @@ def list_meetings():
                      Meeting.language.isnot(None),
                      Meeting.language!='')
              .distinct().all())
-    languages = [l[0] for l in langs if l[0]]
+    languages = [l[0] for l in langs if l[0]] 
 
     return render_template(
         'meetings.html',
