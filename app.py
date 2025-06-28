@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
-
+#
 import os
 import io
 import logging
@@ -1811,3 +1811,5 @@ def process_calendar_analysis(meeting_id):
         logger.error(f"Error during calendar meeting analysis: {str(e)}")
         flash(f'Ocorreu um erro durante a análise: {str(e)}', 'danger')
         return redirect(url_for('edit_calendar_analysis', meeting_id=meeting_id))
+
+#
